@@ -3,3 +3,4 @@ uvicorn[standard]
 sse-starlette
 httpx
 pydantic
+python-dotenv
