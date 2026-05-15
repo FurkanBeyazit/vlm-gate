@@ -41,11 +41,27 @@ def pick_sample_image() -> Path:
     raise FileNotFoundError(f"sample image path not found: {p}")
 
 
-class FromGate(BaseModel):
+class VmsDetail(BaseModel):
     node_id: int
-    type: str
-    detected_time: str
     channel: int
+
+
+class VmsBlock(BaseModel):
+    detail: VmsDetail
+
+
+class EventBlock(BaseModel):
+    start_time: str = ""
+
+
+class InfoBlock(BaseModel):
+    event: EventBlock = EventBlock()
+
+
+class FromGate(BaseModel):
+    """VLM-GATE'ten gelen VMS formatı payload."""
+    vms: VmsBlock
+    info: InfoBlock = InfoBlock()
 
 
 def load_image_b64(p: Path) -> str:
@@ -59,14 +75,16 @@ def build_vlm_input(req: FromGate, image_b64: str) -> dict:
     ("forwarder - No callback_url configured" log'undan kanıt).
     Park Hoonbeom config'ine callback_url eklediğinde forwarder push eder.
     """
+    node_id = req.vms.detail.node_id
+    channel = req.vms.detail.channel
+    start_time = req.info.event.start_time or datetime.now().strftime("%Y%m%d-%H%M%S")
+
     return {
         "info": {
             "event": {
-                "detected_time": req.detected_time,
-                "type": req.type,
                 "image": image_b64,
                 "description": "",
-                "start_time": datetime.now().strftime("%Y%m%d-%H%M%S"),
+                "start_time": start_time,
                 "end_time": datetime.now().strftime("%Y%m%d-%H%M%S"),
                 "snapshot_period": 10,
             }
@@ -78,10 +96,10 @@ def build_vlm_input(req: FromGate, image_b64: str) -> dict:
         "vms": {
             "detail": {
                 "cam_name": "fake_cam",
-                "channel": req.channel,
+                "channel": channel,
                 "management_code": "336",
                 "model_name": "ONVIF",
-                "node_id": req.node_id,
+                "node_id": node_id,
             },
             "type": "danusys",
         },
@@ -91,12 +109,15 @@ def build_vlm_input(req: FromGate, image_b64: str) -> dict:
 @app.post("/from-vlm-gate")
 async def from_vlm_gate(req: FromGate):
     """VLM-GATE'in trigger'ı buraya gelir. Image hazırla, VLM'e gönder, biz işten çıkarız."""
+    node_id = req.vms.detail.node_id
+    channel = req.vms.detail.channel
+
     try:
         image_path = pick_sample_image()
     except FileNotFoundError as e:
         raise HTTPException(500, str(e))
 
-    print(f"[fake_vms] node={req.node_id} type={req.type} ch={req.channel} image={image_path}")
+    print(f"[fake_vms] node={node_id} ch={channel} image={image_path}")
 
     image_b64 = load_image_b64(image_path)
     vlm_input = build_vlm_input(req, image_b64)

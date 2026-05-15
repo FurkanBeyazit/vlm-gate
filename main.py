@@ -2,9 +2,9 @@
 VLM-GATE — LLM ile VMS/VLM arasındaki köprü servisi.
 
 Endpoint'ler:
-  POST /trigger        ← LLM'den gelir, VMS'e forward eder
-  POST /vlm-result     ← VMS/VLM'den gelir, LLM şemasına çevirip SSE'ye yayar
-  GET  /stream         ← LLM bağlanır, sonuçları sürekli alır (uzun süreli SSE)
+  POST /trigger        ← LLM'den gelir; SSE bağlantısı açar, VMS'e forward eder,
+                         VLM sonucu gelince event yayıp bağlantıyı kapatır (30s timeout)
+  POST /vlm-result     ← VMS/VLM'den gelir, LLM şemasına çevirip ilgili SSE'ye yayar
   GET  /image?path=... ← Mounted klasörden foto serve eder
   DELETE /image?path=  ← Foto siler
   GET  /health         ← Servis durumu
@@ -20,12 +20,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -35,8 +35,10 @@ import image_store
 
 app = FastAPI(title="VLM-GATE")
 
-SUBSCRIBERS: list[asyncio.Queue] = []
-PENDING_TRIGGERS: dict[int, dict[str, Any]] = {}
+# node_id → (trigger_data, result_queue) — her /trigger isteği için bir kayıt
+PENDING: dict[int, tuple[dict[str, Any], asyncio.Queue]] = {}
+
+VLM_RESULT_TIMEOUT = 30  # saniye
 
 
 class TriggerRequest(BaseModel):
@@ -46,8 +48,11 @@ class TriggerRequest(BaseModel):
     node_id: int
 
 
-def utc_now_compact() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+KST = timezone(timedelta(hours=9))
+
+
+def kst_now_compact() -> str:
+    return datetime.now(KST).strftime("%Y%m%d%H%M%S")
 
 
 def llm_time_to_vms_time(t: str) -> str:
@@ -97,7 +102,7 @@ def build_llm_payload(trigger: dict[str, Any], description: str, image_path: str
         "node_id": trigger["node_id"],
         "data": [
             {
-                "timestamp": utc_now_compact(),
+                "timestamp": kst_now_compact(),
                 "description": description,
                 "api": image_api_url(image_path),
             }
@@ -106,27 +111,45 @@ def build_llm_payload(trigger: dict[str, Any], description: str, image_path: str
 
 
 @app.post("/trigger")
-async def trigger(req: TriggerRequest):
+async def trigger(request: Request, req: TriggerRequest):
     """
-    LLM'den gelen trigger'ı VMS şemasına dönüştürüp ilet.
-    type ve detected_time alanlarını PENDING_TRIGGERS'ta saklıyoruz —
-    VLM push'u dönünce LLM'e geri yansıtacağız.
+    LLM'den gelen trigger'ı VMS'e iletir ve SSE bağlantısını açık tutar.
+    VLM sonucu /vlm-result üzerinden gelince vlm_description eventi yayıp kapanır.
+    30 saniye içinde sonuç gelmezse timeout eventi gönderilir.
+    Client erken koparsa finally bloğu PENDING'i temizler.
     """
-    PENDING_TRIGGERS[req.node_id] = req.model_dump()
+    queue: asyncio.Queue = asyncio.Queue()
+    PENDING[req.node_id] = (req.model_dump(), queue)
+
     vms_payload = build_vms_payload(req)
 
-    async with httpx.AsyncClient(timeout=10) as client:
+    async def event_gen():
         try:
-            resp = await client.post(config.VMS_URL, json=vms_payload)
-            resp.raise_for_status()
-        except httpx.HTTPError as e:
-            raise HTTPException(502, f"VMS forward failed: {e}")
-    return {
-        "status": "forwarded",
-        "vms_url": config.VMS_URL,
-        "vms_payload": vms_payload,
-        "subscribers": len(SUBSCRIBERS),
-    }
+            # VMS'e forward et
+            async with httpx.AsyncClient(timeout=10) as client:
+                try:
+                    resp = await client.post(config.VMS_URL, json=vms_payload)
+                    resp.raise_for_status()
+                except httpx.HTTPError as e:
+                    yield {"event": "error", "data": json.dumps({"message": f"VMS forward failed: {e}"})}
+                    return
+
+            yield {"event": "forwarded", "data": json.dumps({"status": "forwarded", "vms_url": config.VMS_URL})}
+
+            # VLM sonucunu bekle; client kopunca asyncio.CancelledError fırlar → finally çalışır
+            try:
+                result = await asyncio.wait_for(queue.get(), timeout=VLM_RESULT_TIMEOUT)
+                yield {
+                    "event": "vlm_description",
+                    "data": json.dumps(result, ensure_ascii=False),
+                }
+            except asyncio.TimeoutError:
+                yield {"event": "timeout", "data": json.dumps({"message": f"no result in {VLM_RESULT_TIMEOUT}s"})}
+        finally:
+            PENDING.pop(req.node_id, None)
+
+    # ping=86400: pratikte ping atmaz (bağlantı 30s'de kapanıyor zaten)
+    return EventSourceResponse(event_gen(), ping=86400)
 
 
 def extract_node_id(vlm_payload: dict) -> int | None:
@@ -168,63 +191,29 @@ def extract_image_path(vlm_payload: dict) -> str:
 @app.post("/vlm-result")
 async def vlm_result(payload: dict[str, Any]):
     """
-    VMS/VLM sonucu push eder. Pending trigger ile eşleştirip LLM şemasına çevir,
-    tüm açık SSE subscriber'larına yay.
+    VMS/VLM sonucu push eder. Bekleyen /trigger SSE bağlantısıyla eşleştirip sonucu iletir.
     """
     node_id = extract_node_id(payload)
     desc_preview = extract_description(payload)[:60]
     print(f"[vlm-result] PUSH alındı node_id={node_id} desc='{desc_preview}...'")
 
-    trigger = PENDING_TRIGGERS.get(node_id) if node_id is not None else None
+    pending = PENDING.get(node_id) if node_id is not None else None
 
-    if trigger is None:
-        # Eşleşen trigger yok — yine de gönder, ama log et.
-        # node_id varsa minimum trigger oluştur, yoksa boş alanlar.
-        trigger = {
-            "detected_time": "",
-            "type": "",
-            "channel": 0,
-            "node_id": node_id or 0,
-        }
-        print(f"[vlm-result] WARN: no matching trigger for node_id={node_id}")
+    if pending is None:
+        print(f"[vlm-result] WARN: no waiting trigger for node_id={node_id}")
+        return {"ok": False, "reason": "no waiting trigger", "node_id": node_id}
+
+    trigger_data, queue = pending
 
     out = build_llm_payload(
-        trigger=trigger,
+        trigger=trigger_data,
         description=extract_description(payload),
         image_path=extract_image_path(payload),
     )
 
-    for q in list(SUBSCRIBERS):
-        await q.put(out)
+    await queue.put(out)
+    return {"ok": True, "node_id": node_id}
 
-    return {"ok": True, "delivered_to": len(SUBSCRIBERS), "node_id": node_id}
-
-
-@app.get("/stream")
-async def stream():
-    queue: asyncio.Queue = asyncio.Queue()
-    SUBSCRIBERS.append(queue)
-
-    async def event_gen():
-        try:
-            counter = 0
-            yield {
-                "event": "connected",
-                "data": json.dumps({"msg": "subscribed to VLM stream"}),
-            }
-            while True:
-                payload = await queue.get()
-                yield {
-                    "event": "vlm_description",
-                    "id": str(counter),
-                    "data": json.dumps(payload, ensure_ascii=False),
-                }
-                counter += 1
-        finally:
-            if queue in SUBSCRIBERS:
-                SUBSCRIBERS.remove(queue)
-
-    return EventSourceResponse(event_gen())
 
 
 @app.get("/image")
@@ -254,8 +243,7 @@ async def delete_image(path: str = Query(...)):
 async def health():
     return {
         "status": "ok",
-        "subscribers": len(SUBSCRIBERS),
-        "pending_triggers": list(PENDING_TRIGGERS.keys()),
+        "pending_node_ids": list(PENDING.keys()),
         "vms_url": config.VMS_URL,
         "vlm_url": config.VLM_URL,
         "image_root": str(image_store.IMAGE_ROOT),
